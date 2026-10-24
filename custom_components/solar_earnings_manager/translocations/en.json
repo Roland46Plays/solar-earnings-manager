@@ -1,0 +1,10 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Solar Earnings Manager",
+        "description": "Configure Solar Earnings Manager."
+      }
+    }
+  }
+}

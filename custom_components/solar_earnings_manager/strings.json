@@ -1,0 +1,15 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Solar Earnings Manager",
+        "description": "Configure export sensor and feed-in tariff.",
+        "data": {
+          "export_entity": "Export Energy Sensor",
+          "tariff": "Feed In Tariff",
+          "currency": "Currency"
+        }
+      }
+    }
+  }
+}
