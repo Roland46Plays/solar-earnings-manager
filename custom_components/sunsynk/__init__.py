@@ -1,0 +1,620 @@
+"""Sunsynk / Deye Solar Inverter integration for Home Assistant."""
+from __future__ import annotations
+
+import inspect
+import json
+import logging
+import re
+from pathlib import Path
+from typing import Any
+
+import homeassistant.helpers.config_validation as cv
+import voluptuous as vol
+from homeassistant.auth.permissions.const import POLICY_CONTROL
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, Platform
+from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.exceptions import Unauthorized, UnknownUser
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
+
+from .api.auth import SunsynkAuth
+from .calibration import PerformanceRatioCalibrator
+from .const import (
+    CONF_API_SERVER,
+    CONF_CHEAP_CHARGE_CURRENT,
+    CONF_CHEAP_TARGET_SOC,
+    CONF_CHEAP_THRESHOLD,
+    CONF_CREATE_DASHBOARD,
+    CONF_DISCHARGE_MIN_SOC,
+    CONF_EXPENSIVE_THRESHOLD,
+    CONF_EXPORT_PRICE_ENTITY,
+    CONF_LATITUDE,
+    CONF_LONGITUDE,
+    CONF_NORMAL_CHARGE_CURRENT,
+    CONF_NORMAL_DISCHARGE_CURRENT,
+    CONF_PANEL_KWP,
+    CONF_PEAK_DISCHARGE_CURRENT,
+    CONF_PERFORMANCE_RATIO,
+    CONF_PRICE_ENTITY,
+    CONF_PRICE_MAX_AGE,
+    CONF_REFRESH_INTERVAL,
+    CONF_SERIALS,
+    CONF_TARIFF_END_HOUR,
+    CONF_TARIFF_START_HOUR,
+    DEFAULT_CHEAP_TARGET_SOC,
+    DEFAULT_DISCHARGE_MIN_SOC,
+    DEFAULT_PERFORMANCE_RATIO,
+    DEFAULT_PRICE_MAX_AGE,
+    DEFAULT_REFRESH_INTERVAL,
+    DOMAIN,
+)
+from .coordinator import SolarForecastCoordinator, SunsynkCoordinator
+from .dashboard import build_dashboard
+from .tariff import TariffChargingManager
+from .virtual_slots import (
+    MAX_VIRTUAL_SLOTS,
+    WEEKDAY_NAMES,
+    VirtualSlot,
+    VirtualSlotScheduler,
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+PLATFORMS = [Platform.SENSOR, Platform.NUMBER, Platform.SWITCH, Platform.TEXT]
+
+SERVICE_FORCE_CHARGE = "force_charge"
+SERVICE_FORCE_DISCHARGE = "force_discharge"
+SERVICE_SET_WORK_MODE = "set_work_mode"
+SERVICE_SET_VIRTUAL_SLOT = "set_virtual_slot"
+SERVICE_CLEAR_VIRTUAL_SLOT = "clear_virtual_slot"
+
+_SERVICE_SERIAL_CURRENT_SCHEMA = vol.Schema({
+    vol.Required("serial"): str,
+    vol.Required("current"): vol.All(vol.Coerce(int), vol.Range(min=0, max=500)),
+})
+_SERVICE_SET_WORK_MODE_SCHEMA = vol.Schema({
+    vol.Required("serial"): str,
+    vol.Required("mode"): vol.All(vol.Coerce(int), vol.Range(min=0, max=4)),
+})
+# Sunsynk's portal UI only ever offers :00/:30 options; 1.9.1 assumed that
+# was a hard inverter-side requirement after one reporter's portal test
+# rejected 22:45 (#21). A later reporter's real-world use of Predbat —
+# which writes 5-minute-granularity schedules straight through this same
+# settings-write API — showed their inverter accepts and executes
+# non-:00/:30 values without issue (#25), so this only validates a
+# well-formed HH:MM now, not a specific minute granularity. If your
+# inverter silently ignores a non-:00/:30 value, stick to :00/:30.
+_TIME_HH_MM_PATTERN = r"^([01]\d|2[0-3]):([0-5]\d)$"
+_SERVICE_SET_VIRTUAL_SLOT_SCHEMA = vol.Schema({
+    vol.Required("serial"): str,
+    vol.Required("slot_id"): vol.All(vol.Coerce(int), vol.Range(min=1, max=MAX_VIRTUAL_SLOTS)),
+    vol.Required("start"): cv.matches_regex(_TIME_HH_MM_PATTERN),
+    vol.Required("end"): cv.matches_regex(_TIME_HH_MM_PATTERN),
+    vol.Optional("weekdays"): [vol.In(WEEKDAY_NAMES)],
+    vol.Required("mode"): vol.In(["charge", "discharge", "idle"]),
+    vol.Optional("current"): vol.All(vol.Coerce(int), vol.Range(min=0, max=500)),
+    vol.Optional("target_soc"): vol.All(vol.Coerce(int), vol.Range(min=0, max=100)),
+    vol.Optional("sell_power", default=0): vol.All(vol.Coerce(int), vol.Range(min=0, max=20000)),
+    vol.Optional("priority", default=0): vol.All(vol.Coerce(int), vol.Range(min=0, max=100)),
+    vol.Optional("enabled", default=True): cv.boolean,
+})
+_SERVICE_CLEAR_VIRTUAL_SLOT_SCHEMA = vol.Schema({
+    vol.Required("serial"): str,
+    vol.Required("slot_id"): vol.All(vol.Coerce(int), vol.Range(min=1, max=MAX_VIRTUAL_SLOTS)),
+})
+
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
+_CARD_JS = "sunsynk-power-flow-card.js"
+_CARD_URL = f"/sunsynk/{_CARD_JS}"
+_MANIFEST_VERSION = "0"
+try:
+    with (Path(__file__).parent / "manifest.json").open(
+        encoding="utf-8"
+    ) as manifest_file:
+        _MANIFEST_VERSION = json.load(manifest_file).get("version", _MANIFEST_VERSION)
+except Exception as err:  # noqa: BLE001
+    _LOGGER.debug("Could not read manifest.json version: %s", err)
+_CARD_RESOURCE_URL = f"{_CARD_URL}?v={_MANIFEST_VERSION}"
+
+
+async def _maybe_await(value: Any) -> Any:
+    """Await a value only when Home Assistant exposes it as a coroutine."""
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+async def _async_register_lovelace_resource(hass: HomeAssistant) -> None:
+    """Register the bundled card as a Lovelace module resource."""
+    lovelace = hass.data.get("lovelace")
+    resources = getattr(lovelace, "resources", None)
+    if resources is None:
+        _LOGGER.debug(
+            "Sunsynk: Lovelace resources unavailable; relying on frontend module load"
+        )
+        return
+
+    try:
+        if (
+            hasattr(resources, "async_load")
+            and getattr(resources, "loaded", True) is False
+        ):
+            await resources.async_load()
+
+        items = await _maybe_await(resources.async_items()) or []
+        existing = [
+            item
+            for item in items
+            if str(item.get("url", "")).split("?", 1)[0] == _CARD_URL
+        ]
+
+        if existing:
+            item = existing[0]
+            updates: dict[str, str] = {}
+            if item.get("url") != _CARD_RESOURCE_URL:
+                updates["url"] = _CARD_RESOURCE_URL
+            if item.get("type") != "module":
+                updates["res_type"] = "module"
+            if updates and item.get("id") and hasattr(resources, "async_update_item"):
+                await resources.async_update_item(item["id"], updates)
+                _LOGGER.debug("Sunsynk Power Flow Card Lovelace resource updated")
+            return
+
+        if hasattr(resources, "async_create_item"):
+            await resources.async_create_item(
+                {
+                    "res_type": "module",
+                    "url": _CARD_RESOURCE_URL,
+                }
+            )
+            _LOGGER.debug("Sunsynk Power Flow Card Lovelace resource registered")
+        else:
+            _LOGGER.debug(
+                "Sunsynk: Lovelace resources are read-only; add %s manually",
+                _CARD_RESOURCE_URL,
+            )
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.warning(
+            "Could not register Sunsynk Power Flow Card Lovelace resource: %s",
+            err,
+        )
+
+
+def _find_coordinator(hass: HomeAssistant, serial: str) -> SunsynkCoordinator | None:
+    """Find the coordinator that owns a given inverter serial."""
+    for val in hass.data.get(DOMAIN, {}).values():
+        if isinstance(val, SunsynkCoordinator) and serial in val.serials:
+            return val
+    return None
+
+
+async def _async_ensure_control_allowed(
+    hass: HomeAssistant, call: ServiceCall, serial: str
+) -> None:
+    """Refuse a control action from a user who may not control this inverter.
+
+    A user must be allowed to control the inverter's entities, so a read-only
+    user can't change the inverter through an action. Automations and
+    scripts run without a user and are always allowed.
+    """
+    context = getattr(call, "context", None)
+    if context is None or context.user_id is None:
+        return
+    user = await hass.auth.async_get_user(context.user_id)
+    if user is None:
+        raise UnknownUser(context=context)
+    if user.is_admin:
+        return
+    device = dr.async_get(hass).async_get_device(identifiers={(DOMAIN, serial)})
+    entity_ids = (
+        [e.entity_id for e in er.async_entries_for_device(er.async_get(hass), device.id)]
+        if device is not None
+        else []
+    )
+    if not any(user.permissions.check_entity(e, POLICY_CONTROL) for e in entity_ids):
+        raise Unauthorized(context=context, permission=POLICY_CONTROL)
+
+
+def _find_entry_id_for_serial(hass: HomeAssistant, serial: str) -> str | None:
+    """Find the config entry id that owns a given inverter serial.
+
+    Coordinators are stored at hass.data[DOMAIN][entry_id] (unsuffixed),
+    unlike the tariff/vslots/forecast companions which use a suffixed key.
+    """
+    for key, val in hass.data.get(DOMAIN, {}).items():
+        if isinstance(val, SunsynkCoordinator) and serial in val.serials:
+            return key
+    return None
+
+
+async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+    """Register the bundled Sunsynk Power Flow Card frontend resource."""
+    card_path = str(Path(__file__).parent / "www" / _CARD_JS)
+
+    # Register static path — API changed in HA 2024.7
+    try:
+        from homeassistant.components.http import StaticPathConfig  # HA 2024.7+
+        await hass.http.async_register_static_paths(
+            [StaticPathConfig(_CARD_URL, card_path, False)]
+        )
+    except (ImportError, AttributeError):
+        try:
+            hass.http.register_static_path(_CARD_URL, card_path, cache_headers=False)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Could not serve card static file: %s", err)
+            return True
+
+    # Register as extra frontend module so HA loads it automatically
+    try:
+        from homeassistant.components.frontend import add_extra_js_url
+        add_extra_js_url(hass, _CARD_RESOURCE_URL)
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.debug("Could not register extra frontend JS module: %s", err)
+
+    await _async_register_lovelace_resource(hass)
+
+    _LOGGER.debug("Sunsynk Power Flow Card registered at %s", _CARD_RESOURCE_URL)
+
+    async def _handle_force_charge(call: ServiceCall) -> None:
+        serial: str = call.data["serial"]
+        await _async_ensure_control_allowed(hass, call, serial)
+        coordinator = _find_coordinator(hass, serial)
+        if coordinator is None:
+            raise ValueError(f"No Sunsynk inverter found with serial {serial!r}")
+        await coordinator.async_write_setting(serial, "chargeCurrent", call.data["current"])
+
+    async def _handle_force_discharge(call: ServiceCall) -> None:
+        serial: str = call.data["serial"]
+        await _async_ensure_control_allowed(hass, call, serial)
+        coordinator = _find_coordinator(hass, serial)
+        if coordinator is None:
+            raise ValueError(f"No Sunsynk inverter found with serial {serial!r}")
+        await coordinator.async_write_setting(serial, "dischargeCurrent", call.data["current"])
+
+    async def _handle_set_work_mode(call: ServiceCall) -> None:
+        serial: str = call.data["serial"]
+        await _async_ensure_control_allowed(hass, call, serial)
+        coordinator = _find_coordinator(hass, serial)
+        if coordinator is None:
+            raise ValueError(f"No Sunsynk inverter found with serial {serial!r}")
+        await coordinator.async_write_setting(serial, "sysWorkMode", call.data["mode"])
+
+    async def _handle_set_virtual_slot(call: ServiceCall) -> None:
+        serial: str = call.data["serial"]
+        await _async_ensure_control_allowed(hass, call, serial)
+        entry_id = _find_entry_id_for_serial(hass, serial)
+        if entry_id is None:
+            raise ValueError(f"No Sunsynk inverter found with serial {serial!r}")
+        scheduler: VirtualSlotScheduler | None = hass.data[DOMAIN].get(f"{entry_id}_vslots")
+        if scheduler is None:
+            raise ValueError("Virtual slot scheduler not initialised for this inverter")
+        weekdays = call.data.get("weekdays") or list(WEEKDAY_NAMES)
+        slot = VirtualSlot(
+            slot_id=call.data["slot_id"],
+            start=call.data["start"],
+            end=call.data["end"],
+            mode=call.data["mode"],
+            weekdays=frozenset(WEEKDAY_NAMES.index(d) for d in weekdays),
+            current=call.data.get("current"),
+            target_soc=call.data.get("target_soc"),
+            sell_power=call.data["sell_power"],
+            priority=call.data["priority"],
+            enabled=call.data["enabled"],
+        )
+        await scheduler.async_set_slot(slot)
+
+    async def _handle_clear_virtual_slot(call: ServiceCall) -> None:
+        serial: str = call.data["serial"]
+        await _async_ensure_control_allowed(hass, call, serial)
+        entry_id = _find_entry_id_for_serial(hass, serial)
+        if entry_id is None:
+            raise ValueError(f"No Sunsynk inverter found with serial {serial!r}")
+        scheduler: VirtualSlotScheduler | None = hass.data[DOMAIN].get(f"{entry_id}_vslots")
+        if scheduler is None:
+            raise ValueError("Virtual slot scheduler not initialised for this inverter")
+        await scheduler.async_clear_slot(call.data["slot_id"])
+
+    hass.services.async_register(
+        DOMAIN, SERVICE_FORCE_CHARGE, _handle_force_charge, _SERVICE_SERIAL_CURRENT_SCHEMA
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_FORCE_DISCHARGE, _handle_force_discharge, _SERVICE_SERIAL_CURRENT_SCHEMA
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_SET_WORK_MODE, _handle_set_work_mode, _SERVICE_SET_WORK_MODE_SCHEMA
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_SET_VIRTUAL_SLOT, _handle_set_virtual_slot, _SERVICE_SET_VIRTUAL_SLOT_SCHEMA
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_CLEAR_VIRTUAL_SLOT, _handle_clear_virtual_slot, _SERVICE_CLEAR_VIRTUAL_SLOT_SCHEMA
+    )
+
+    return True
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Set up Sunsynk from a config entry."""
+    hass.data.setdefault(DOMAIN, {})
+
+    refresh_interval = entry.options.get(
+        CONF_REFRESH_INTERVAL,
+        entry.data.get(CONF_REFRESH_INTERVAL, DEFAULT_REFRESH_INTERVAL),
+    )
+    serials: list[str] = entry.options.get(
+        CONF_SERIALS, entry.data.get(CONF_SERIALS, [])
+    )
+
+    auth = SunsynkAuth(
+        api_server=entry.data[CONF_API_SERVER],
+        username=entry.data[CONF_USERNAME],
+        password=entry.data[CONF_PASSWORD],
+    )
+
+    coordinator = SunsynkCoordinator(
+        hass,
+        auth=auth,
+        serials=serials,
+        refresh_interval=refresh_interval,
+        entry_id=entry.entry_id,
+    )
+
+    await coordinator.async_config_entry_first_refresh()
+
+    hass.data[DOMAIN][entry.entry_id] = coordinator
+
+    kwp = entry.options.get(CONF_PANEL_KWP, entry.data.get(CONF_PANEL_KWP))
+    if kwp is not None:
+        lat = entry.options.get(CONF_LATITUDE, entry.data.get(CONF_LATITUDE, hass.config.latitude))
+        lon = entry.options.get(CONF_LONGITUDE, entry.data.get(CONF_LONGITUDE, hass.config.longitude))
+        pr = entry.options.get(
+            CONF_PERFORMANCE_RATIO,
+            entry.data.get(CONF_PERFORMANCE_RATIO, DEFAULT_PERFORMANCE_RATIO),
+        )
+
+        def _actual_pv_energy_today() -> float | None:
+            """Sum today's actual PV generation (kWh) across inverters on this entry."""
+            data = coordinator.data
+            if not data:
+                return None
+            total = 0.0
+            found = False
+            for serial_data in data.values():
+                value = serial_data.get("pv", {}).get("etoday")
+                try:
+                    total += float(value)
+                    found = True
+                except (TypeError, ValueError):
+                    continue
+            return total if found else None
+
+        calibrator = PerformanceRatioCalibrator(hass, entry.entry_id, float(pr))
+        await calibrator.async_load()
+
+        forecast_coordinator = SolarForecastCoordinator(
+            hass,
+            latitude=float(lat),
+            longitude=float(lon),
+            panel_kwp=float(kwp),
+            performance_ratio=float(pr),
+            calibrator=calibrator,
+            actual_energy_fn=_actual_pv_energy_today,
+        )
+        try:
+            await forecast_coordinator.async_config_entry_first_refresh()
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Solar forecast initial fetch failed (will retry): %s", err)
+        hass.data[DOMAIN][f"{entry.entry_id}_forecast"] = forecast_coordinator
+
+    # Tariff manager must be created before platform setup so number.py can find it
+    price_entity = entry.options.get(CONF_PRICE_ENTITY, entry.data.get(CONF_PRICE_ENTITY))
+    if price_entity:
+        def _opt(key: str, default: Any = None) -> Any:
+            return entry.options.get(key, entry.data.get(key, default))
+
+        tariff_manager = TariffChargingManager(
+            hass=hass,
+            coordinator=coordinator,
+            price_entity=price_entity,
+            export_price_entity=_opt(CONF_EXPORT_PRICE_ENTITY),
+            cheap_threshold=_opt(CONF_CHEAP_THRESHOLD),
+            cheap_current=_opt(CONF_CHEAP_CHARGE_CURRENT),
+            normal_charge_current=_opt(CONF_NORMAL_CHARGE_CURRENT),
+            target_soc=_opt(CONF_CHEAP_TARGET_SOC, DEFAULT_CHEAP_TARGET_SOC),
+            expensive_threshold=_opt(CONF_EXPENSIVE_THRESHOLD),
+            peak_discharge_current=_opt(CONF_PEAK_DISCHARGE_CURRENT),
+            normal_discharge_current=_opt(CONF_NORMAL_DISCHARGE_CURRENT),
+            discharge_min_soc=_opt(CONF_DISCHARGE_MIN_SOC, DEFAULT_DISCHARGE_MIN_SOC),
+            start_hour=_opt(CONF_TARIFF_START_HOUR),
+            end_hour=_opt(CONF_TARIFF_END_HOUR),
+            price_max_age_minutes=_opt(CONF_PRICE_MAX_AGE, DEFAULT_PRICE_MAX_AGE),
+        )
+        hass.data[DOMAIN][f"{entry.entry_id}_tariff"] = tariff_manager
+
+    # Virtual slot scheduler: owns physical slots 1 & 6, resolves the
+    # HA-side virtual schedule (+ live tariff override) onto them. Created
+    # regardless of tariff config — it works standalone for pure
+    # time-based scheduling too. Starts disabled; user enables via switch.
+    vslot_scheduler = VirtualSlotScheduler(
+        hass=hass,
+        coordinator=coordinator,
+        entry_id=entry.entry_id,
+        tariff_manager=hass.data[DOMAIN].get(f"{entry.entry_id}_tariff"),
+        normal_charge_current=_opt(CONF_NORMAL_CHARGE_CURRENT) if price_entity else None,
+        normal_discharge_current=_opt(CONF_NORMAL_DISCHARGE_CURRENT) if price_entity else None,
+    )
+    await vslot_scheduler.async_load()
+    hass.data[DOMAIN][f"{entry.entry_id}_vslots"] = vslot_scheduler
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # Start tariff manager after platforms are set up (switch/sensor already registered)
+    tariff_manager = hass.data[DOMAIN].get(f"{entry.entry_id}_tariff")
+    if tariff_manager is not None:
+        tariff_manager.start()
+    vslot_scheduler.start()
+
+    if _dashboard_enabled(entry):
+        hass.async_create_task(_async_setup_dashboard(hass, entry, coordinator))
+
+    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+
+    return True
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Unload a config entry."""
+    if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+        coordinator: SunsynkCoordinator = hass.data[DOMAIN].pop(entry.entry_id)
+        await coordinator.async_close()
+        forecast_coordinator: SolarForecastCoordinator | None = hass.data[DOMAIN].pop(
+            f"{entry.entry_id}_forecast", None
+        )
+        if forecast_coordinator is not None:
+            await forecast_coordinator.async_close()
+        tariff_manager: TariffChargingManager | None = hass.data[DOMAIN].pop(
+            f"{entry.entry_id}_tariff", None
+        )
+        if tariff_manager is not None:
+            tariff_manager.stop()
+        vslot_scheduler: VirtualSlotScheduler | None = hass.data[DOMAIN].pop(
+            f"{entry.entry_id}_vslots", None
+        )
+        if vslot_scheduler is not None:
+            vslot_scheduler.stop()
+
+    return unload_ok
+
+
+def _dashboard_enabled(entry: ConfigEntry) -> bool:
+    """Whether to create and update the dashboard: on unless turned off (#38)."""
+    return bool(
+        entry.options.get(
+            CONF_CREATE_DASHBOARD, entry.data.get(CONF_CREATE_DASHBOARD, True)
+        )
+    )
+
+
+async def _async_setup_dashboard(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    coordinator: SunsynkCoordinator,
+) -> None:
+    """Auto-create a Lovelace dashboard with correct entity IDs for this inverter."""
+    first_serial = coordinator.serials[0] if coordinator.serials else ""
+    inverter_data = (coordinator.data or {}).get(first_serial, {}).get("inverter", {})
+    alias = inverter_data.get("alias") or f"Sunsynk {first_serial}"
+    prefix = re.sub(r"[^a-z0-9]+", "_", alias.lower()).strip("_")
+    url_path = f"sunsynk-{entry.entry_id[:8].lower()}"
+
+    # Look up actual entity IDs from the registry (unique_id = "{serial}_{key}")
+    from homeassistant.helpers import entity_registry as er
+    reg = er.async_get(hass)
+    uid_map: dict[str, str] = {
+        e.unique_id[len(first_serial) + 1:]: e.entity_id
+        for e in reg.entities.values()
+        if e.platform == DOMAIN and e.unique_id.startswith(f"{first_serial}_")
+    }
+    def eid(key: str) -> str | None:
+        return uid_map.get(key)
+
+    forecast_prefix = f"{entry.entry_id}_forecast_"
+    forecast_uid_map: dict[str, str] = {
+        e.unique_id[len(forecast_prefix):]: e.entity_id
+        for e in reg.entities.values()
+        if e.platform == DOMAIN and e.unique_id.startswith(forecast_prefix)
+    }
+    forecast_eid_fn = (lambda key: forecast_uid_map.get(key)) if forecast_uid_map else None
+
+    tariff_prefix = f"{entry.entry_id}_tariff_"
+    tariff_uid_map: dict[str, str] = {
+        e.unique_id[len(tariff_prefix):]: e.entity_id
+        for e in reg.entities.values()
+        if e.platform == DOMAIN and e.unique_id.startswith(tariff_prefix)
+    }
+    tariff_eid_fn = (lambda key: tariff_uid_map.get(key)) if tariff_uid_map else None
+
+    vslot_prefix = f"{entry.entry_id}_vslots_"
+    vslot_uid_map: dict[str, str] = {
+        e.unique_id[len(vslot_prefix):]: e.entity_id
+        for e in reg.entities.values()
+        if e.platform == DOMAIN and e.unique_id.startswith(vslot_prefix)
+    }
+    vslot_eid_fn = (lambda key: vslot_uid_map.get(key)) if vslot_uid_map else None
+
+    dashboard_config = build_dashboard(
+        prefix, eid, forecast_eid_fn, tariff_eid_fn, entry.entry_id, vslot_eid_fn
+    )
+
+    lovelace = hass.data.get("lovelace")
+    dashboards = getattr(lovelace, "dashboards", None)
+
+    # ── Path A: dashboard already registered in lovelace (in-memory dict) ──
+    # dashboards is a dict: url_path → LovelaceStorage object.
+    # Save our config ON that object so it updates both its cache and the file.
+    if isinstance(dashboards, dict) and url_path in dashboards:
+        ha_config = dashboards[url_path]
+        if hasattr(ha_config, "async_save"):
+            try:
+                await ha_config.async_save(dashboard_config)
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.error("Sunsynk: dashboard save failed: %s", err)
+        return
+
+    # ── Path B: dashboard NOT registered yet ────────────────────────────
+    # Register in sidebar FIRST, then save content into the registered object.
+    # async_create_item creates its own LovelaceStorage internally — if we save
+    # content before registering, that content gets overwritten by the empty init.
+    _item = {
+        "url_path": url_path,
+        "require_admin": False,
+        "mode": "storage",
+        "title": f"Solar {alias}",
+        "icon": "mdi:solar-power-variant",
+        "show_in_sidebar": True,
+    }
+    if dashboards is not None and hasattr(dashboards, "async_create_item"):
+        try:
+            await dashboards.async_create_item(_item)
+            _LOGGER.info("Sunsynk: dashboard registered at /%s", url_path)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.error("Sunsynk: dashboard registration failed: %s", err)
+
+        # Save content into the freshly registered dashboard object
+        if isinstance(dashboards, dict) and url_path in dashboards:
+            try:
+                await dashboards[url_path].async_save(dashboard_config)
+                _LOGGER.info("Sunsynk: dashboard content saved")
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.error("Sunsynk: dashboard content save failed: %s", err)
+    else:
+        # Fallback: write content and registration directly to storage files.
+        # Only takes effect after a full HA restart.
+        try:
+            from homeassistant.helpers.storage import Store
+            await Store(hass, 1, f"lovelace.{url_path}").async_save({"config": dashboard_config})
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.error("Sunsynk: dashboard content store failed: %s", err)
+        try:
+            import uuid
+
+            from homeassistant.helpers.storage import Store
+            ds = Store(hass, 1, "lovelace_dashboards")
+            data = await ds.async_load() or {}
+            items: list = data.get("items") or []
+            if not isinstance(items, list):
+                items = []
+            if not any(isinstance(v, dict) and v.get("url_path") == url_path for v in items):
+                items.append({"id": uuid.uuid4().hex, **_item})
+                data["items"] = items
+                await ds.async_save(data)
+            _LOGGER.warning("Sunsynk: dashboard saved to storage — restart HA to see it in sidebar")
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.error("Sunsynk: lovelace_dashboards write failed: %s", err)
+
+
+async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Handle options update."""
+    await hass.config_entries.async_reload(entry.entry_id)

@@ -1,0 +1,23 @@
+- id: '1792076408394'
+  alias: Check Solar Forecast and Set SOC
+  description: ''
+  triggers:
+  - trigger: time
+    at: '23:30:00'
+  actions:
+  - action: logbook.log
+    data:
+      name: Solar Forecast Charge Control
+      message: 'Forecast={{ forecast }} kWh, SOC set to {{ target_soc }}%
+
+        '
+  - action: number.set_value
+    target:
+      entity_id: number.garage_inverter_time_slot_6_limit
+    data:
+      value: '{{ target_soc | int }}'
+  variables:
+    forecast: '{{ states(''sensor.solar_forecast_tomorrow'') | float(0) }}'
+    target_soc: "{% if forecast < 2.5 %}\n  100\n{% elif forecast < 5.0 %}\n  66\n{%
+      elif forecast < 7.5 %}\n  33\n{% else %}\n  25\n{% endif %}\n"
+  mode: single

@@ -1,0 +1,584 @@
+import { css, html, LitElement } from 'lit';
+import { moreInfo } from "./card-tools-compat";
+import { popUp } from "./dwains-popup";
+import { fireEvent } from "./card-tools-compat";
+import {
+    computeDomain
+} from './frontend-helpers';
+import {
+    STATES_OFF,
+    UNAVAILABLE_STATES,
+    ALERT_DOMAINS,
+    COVER_DOMAINS,
+    TOGGLE_DOMAINS,
+    CLIMATE_DOMAINS,
+    OTHER_DOMAINS,
+    DEVICE_CLASSES,
+    DOMAIN_STATE_ICONS
+} from './variables';
+const { defineDwainsElement } = require('./custom-element-registration');
+import translateEngine from './translate-engine';
+import { myComputeStateDisplay, resolveEntityName } from "./helpers";
+import { subtleHouseInformationStyles } from './styles/dwains-subtle-style';
+const { loadDashboardRegistrySnapshot } = require('./dashboard-registry-snapshot');
+const { loadCardHelpers } = require('./card-helpers-loader');
+const { TimerOwner } = require('./timer-owner');
+const { PopupOpenScheduler } = require('./popup-open-scheduler');
+const { ReloadableLoadOwner } = require('./reloadable-load-owner');
+const { hassConnectionIdentity, hasHassConnectionChanged } = require('./hass-connection');
+const { isEntityHiddenInArea } = require('./entity-aggregation');
+//Herschreven
+class DwainsHouseInformationCard extends LitElement {
+    constructor() {
+        super();
+        this._timers = new TimerOwner();
+        this._popupOpens = new PopupOpenScheduler(this._timers);
+        this._loads = new ReloadableLoadOwner((context) => this._loadConfiguration(context));
+    }
+
+    static get styles() {
+        return [css`
+      ha-card {
+        overflow: hidden;
+      }
+      .flex {
+        display: flex;
+      }
+      .justify-center {
+        justify-content: center;
+      }
+      .items-center {
+        align-items: center;
+      }
+      .font-semibold {
+        font-weight: 600;
+      }
+      h1, h2, h3, h4, h5, h6 {
+        font-size: inherit;
+      }
+      blockquote, dd, dl, figure, h1, h2, h3, h4, h5, h6, hr, p, pre {
+        margin: 0;
+      }
+      .p-2 {
+        padding: 0.5rem;
+      }
+      .cursor-pointer {
+        cursor: pointer;
+      }
+      .w-8 {
+        width: 1.5rem;
+      }
+      .h-8 {
+        height: 1.5rem;
+      }
+      .space-x-2>:not([hidden])~:not([hidden]) {
+        --tw-space-x-reverse: 0;
+        margin-right: calc(0.5rem * var(--tw-space-x-reverse));
+        margin-left: calc(0.5rem * calc(1 - var(--tw-space-x-reverse)));
+      }
+      .text-gray-500 {
+        --tw-text-opacity: 1;
+        color: rgba(107,114,128,var(--tw-text-opacity));
+      }
+      .capitalize {
+          text-transform: capitalize;
+      }
+      .ha-icon ha-icon {
+        display: inline-block;
+        margin: auto;
+        --mdc-icon-size: 100% !important;
+        --iron-icon-width: 100% !important;
+        --iron-icon-height: 100% !important;
+      }
+      .text-center {
+        text-align: center;
+      }
+      .rounded-full {
+        border-radius: 9999px;
+      }
+      .not_home {
+        filter: grayscale(100%);
+      }
+      .domain-badge-card h3 {
+        margin-top: 0.4rem;
+      }
+      .m-auto {
+        margin: 0 auto;
+      }
+      .round-badge {
+        background-color: var(--dwains-house-information-badge-background, var(--sidebar-icon-color));
+      }
+      .badge-icon {
+        color: var(--dwains-house-information-badge-color, var(--ha-card-background, var(--card-background-color, white) ) );
+      }
+      .dd-header-tabs {
+        display: flex;
+        flex-direction: row;
+        align-items: center;
+        gap: 8px;
+        height: 110px;
+        padding: 4px 8px;
+        margin: 0 .25rem;
+        overflow-x: auto;
+        overscroll-behavior-x: contain;
+        -webkit-overflow-scrolling: touch;
+        scrollbar-width: none;
+        background: rgba(var(--rgb-card-background-color), .08);
+        border-radius: 12px;
+      }
+      .dd-header-tabs::-webkit-scrollbar {
+        display: none;
+      }
+      .dd-header-tab {
+        display: flex;
+        flex: 1 1 0;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        min-width: 60px;
+        max-width: 88px;
+        padding: 0 4px;
+      }
+      .dd-header-tabs h3 {
+        max-width: 100%;
+        margin: 10px 0 2px;
+        overflow: hidden;
+        font-size: 1rem;
+        font-weight: 500;
+        line-height: 1.3;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .dd-header-tabs span {
+        font-size: .92rem;
+        line-height: 1.25;
+      }
+      @media (max-width: 600px) {
+        .dd-header-tabs {
+          gap: 6px;
+          padding-inline: 6px;
+        }
+        .dd-header-tab {
+          flex: 0 0 auto;
+          min-width: 68px;
+        }
+      }
+
+      .loading-component {
+        height: 110px;
+      }
+    `, subtleHouseInformationStyles(css)]
+    }
+
+    static get properties() {
+        return {
+            _hass: { type: Object },
+            configuration: { type: Object },
+            domains: { type: Object },
+            persons: { type: Array }
+        }
+    }
+
+    setConfig(config) {
+        this.configuration = config;
+    }
+
+    set hass(hass) {
+      const connectionChanged = hasHassConnectionChanged(this._hass, hass);
+      this._hass = hass;
+      this.requestUpdate();
+      void this._startIfReady(connectionChanged);
+    }
+
+    _entityDisplayName(entityId, entityRegistryEntry) {
+        const entityEntry = entityRegistryEntry || this.entitiesById?.get(entityId);
+        const deviceEntry = entityEntry?.device_id
+            ? this.devicesById?.get(entityEntry.device_id)
+            : undefined;
+        return resolveEntityName(
+            this._hass,
+            this.configuration,
+            entityId,
+            entityEntry,
+            deviceEntry,
+        );
+    }
+
+    async connectedCallback() {
+        super.connectedCallback();
+        this._timers.connect();
+        await this._startIfReady();
+    }
+
+    async _startIfReady(reload = false) {
+        const connection = hassConnectionIdentity(this._hass);
+        if (!this.isConnected || !this._hass || this._startedHass === connection) return;
+        const hass = this._hass;
+        this._startedHass = connection;
+        try {
+            if (reload) await this._loads.reload();
+            else await this._loadData();
+        } catch (error) {
+            if (this._startedHass === connection) this._startedHass = undefined;
+            console.error('Error starting house information card:', error);
+        }
+    }
+
+    disconnectedCallback() {
+        super.disconnectedCallback();
+        this._startedHass = undefined;
+        this._loads.invalidate();
+        this._timers.disconnect();
+    }
+
+    async _reloadCard() {
+        await this._loads.reload();
+        this.requestUpdate();
+    }
+
+    _loadData() {
+        return this._loads.load();
+    }
+
+    async _loadConfiguration({ isCurrent = () => true } = {}) {
+        const snapshot = await loadDashboardRegistrySnapshot(this._hass);
+        if (!isCurrent()) return;
+        Object.assign(this, snapshot);
+
+        loadCardHelpers().catch((error) => {
+            console.error("Failed to preload house-information card helpers", error);
+        });
+
+        if (this.areas == null || this.areas.length === 0
+            || this.devices == null || this.devices.length === 0
+            || this.entities == null || this.entities.length === 0
+            || this.configuration == null || this.configuration.length === 0
+        ) {
+        } else {
+            const domains = [];
+            const persons = [];
+
+            //Loop throught the person because persons doesnt hang into an area but we still want persons :D
+            for (const entity of this.entities) {
+                const domain = computeDomain(entity.entity_id);
+                if (domain == 'person') {
+                    const entityConfig = this.configuration['entities']
+                        ? (this.configuration['entities'][entity.entity_id] || {})
+                        : {};
+                    if (
+                        !entity.hidden_by
+                        && !entityConfig['disabled']
+                        && !entityConfig['excluded']
+                        && !entityConfig['hidden']
+                    ) {
+                        persons.push(entity.entity_id);
+                    }
+                }
+            }
+
+            //Loop throught all areas to get all entities assigned to an area to populate the data group
+            for (const area of this.areas) {
+                if (
+                    !(this.configuration['areas'][area.area_id] && this.configuration['areas'][area.area_id]['disabled'])
+                ) {
+                    const areaEntities = new Set();
+                    const areaCardsByDomain = [];
+                    const areaEntitiesNoState = [];
+
+                    for (const entity of this.entitiesByAreaId.get(area.area_id) || []) {
+                        if (!entity.hidden_by) {
+                            const disableEntity = this.configuration['entities'][entity.entity_id] ? (this.configuration['entities'][entity.entity_id]['disabled'] ? true : false) : false;
+                            const excludeEntity = this.configuration['entities'][entity.entity_id] ? (this.configuration['entities'][entity.entity_id]['excluded'] ? true : false) : false;
+                            const hideEntity = this.configuration['entities'][entity.entity_id] ? (this.configuration['entities'][entity.entity_id]['hidden'] ? true : false) : false;
+                            const hideEntityInArea = isEntityHiddenInArea(
+                                this.configuration['entities']?.[entity.entity_id],
+                            );
+
+                            if (!disableEntity && !excludeEntity && !hideEntity && !hideEntityInArea) {
+                                const friendlyName = this._entityDisplayName(entity.entity_id, entity);
+                                const domain = computeDomain(entity.entity_id);
+
+                                if (
+                                    !TOGGLE_DOMAINS.includes(domain) &&
+                                    !ALERT_DOMAINS.includes(domain) &&
+                                    !COVER_DOMAINS.includes(domain) &&
+                                    !CLIMATE_DOMAINS.includes(domain) &&
+                                    !OTHER_DOMAINS.includes(domain)
+                                ) {
+                                    continue;
+                                }
+
+                                if (!(domain in domains)) {
+                                    domains[domain] = { domain: domain, entities: [] };
+                                }
+                                domains[domain].entities.push({
+                                    entity_id: entity.entity_id,
+                                    area: area,
+                                    friendlyName: friendlyName,
+                                });
+                            }
+
+                        }
+                    }
+                }
+            }
+            this.domains = domains;
+            this.persons = persons;
+        }
+    }
+
+    _handleMoreInfo(ev) {
+        if (ev.currentTarget.entity) {
+            moreInfo(ev.currentTarget.entity);
+        } else {
+            const domain = ev.currentTarget.domain;
+            const deviceClass = ev.currentTarget.deviceClass;
+            const configured = this.domains?.[domain]?.entities;
+            const entities = domain === 'climate' && (!configured || configured.length === 0)
+                ? Object.keys(this._hass.states)
+                    .filter((entityId) =>
+                        entityId.startsWith('climate.')
+                        && !isEntityHiddenInArea(
+                            this.configuration?.entities?.[entityId],
+                        )
+                    )
+                    .map((entityId) => ({
+                        entity_id: entityId,
+                        area: {},
+                        friendlyName: this._entityDisplayName(entityId),
+                    }))
+                : (configured || []);
+            this._popupOpens.schedule(() => {
+                fireEvent("hass-more-info", { entityId: "" }, this);
+                popUp(translateEngine(this._hass, 'device.' + domain), {
+                    type: "custom:dwains-house-information-more-info-card",
+                    domain: domain,
+                    entities: entities,
+                    deviceClass: domain === 'climate' ? '' : deviceClass,
+                    configuration: this.configuration,
+                }, true, '');
+            });
+        }
+    }
+
+    _isOn(entities, domain, deviceClass) {
+        if (!entities) {
+            return undefined;
+        }
+        return ((
+            deviceClass
+                ? entities.filter(
+                    (entity) => entity.attributes.device_class === deviceClass
+                )
+                : entities
+        ).filter(
+            (entity) => {
+                const config = this.configuration?.entities?.[entity.entity_id];
+                return !entity.hidden_by &&
+                    !(config?.disabled || config?.excluded || config?.hidden || config?.hidden_in_area) &&
+                    !UNAVAILABLE_STATES.includes(entity.state) &&
+                    !STATES_OFF.includes(entity.state);
+            }
+        ).length);
+    }
+
+    _isOnCover(entities, domain, deviceClass) {
+        if (!entities) {
+            return undefined;
+        }
+
+        return ((
+            deviceClass
+                ? entities.filter(
+                    (entity) => entity.attributes.device_class === deviceClass
+                )
+                : entities
+        ).filter(
+            (entity) =>
+                !UNAVAILABLE_STATES.includes(entity.state) &&
+                !STATES_OFF.includes(entity.state) &&
+                !this.configuration['homepage_header']['invert_cover']
+        ).length);
+    }
+
+    _isOffCover(entities, domain, deviceClass) {
+        if (!entities) {
+            return undefined;
+        }
+
+        return ((
+            deviceClass
+                ? entities.filter(
+                    (entity) => entity.attributes.device_class === deviceClass
+                )
+                : entities
+        ).filter(
+            (entity) =>
+                !UNAVAILABLE_STATES.includes(entity.state) &&
+                STATES_OFF.includes(entity.state) &&
+                this.configuration['homepage_header']['invert_cover']
+        ).length);
+
+    }
+
+    _isOnClimate(entities, domain) {
+        if (!entities) {
+            return undefined;
+        }
+        const climateStates = [];
+        for (const climate of entities) {
+            if (climate.attributes['hvac_action'] && climate.attributes['hvac_action'] != 'idle') {
+                if (!UNAVAILABLE_STATES.includes(climate.attributes['hvac_action']) && !STATES_OFF.includes(climate.attributes['hvac_action'])) {
+                    climateStates.push(climate.entity_id);
+                }
+            } else if (!climate.attributes['hvac_action']) {
+                if (!UNAVAILABLE_STATES.includes(climate.state) && !STATES_OFF.includes(climate.state)) {
+                    climateStates.push(climate.entity_id);
+                }
+            }
+        }
+        return climateStates.length;
+    }
+
+
+    _renderDomain(domain) {
+        const entitiesByDomain = [];
+
+        for (const entity of domain.entities) {
+            const stateObj = this._hass.states[entity.entity_id];
+
+            if (!stateObj) {
+                continue;
+            }
+
+            entitiesByDomain.push(stateObj);
+        }
+
+        if (TOGGLE_DOMAINS.includes(domain.domain)) {
+            //If domain is in toggle domains (light, fan, switch)
+            const on = this._isOn(entitiesByDomain, domain);
+            if (on) {
+                return this._renderDomainBadgeCard(domain.domain, translateEngine(this._hass, 'device.' + domain.domain), DOMAIN_STATE_ICONS[domain.domain][on ? "on" : "off"], on, '');
+            }
+        } else if (ALERT_DOMAINS.includes(domain.domain)) {
+            //If domain is alert domain binary_sensor (check device_classes ("motion", "door", "window"))
+            return DEVICE_CLASSES[domain.domain].map((deviceClass) => {
+                const on = this._isOn(entitiesByDomain, domain.domain, deviceClass);
+                if (on) {
+                    return this._renderDomainBadgeCard(domain.domain, translateEngine(this._hass, 'device.' + deviceClass), DOMAIN_STATE_ICONS[domain.domain][deviceClass], on, deviceClass);
+                }
+            });
+        } else if (COVER_DOMAINS.includes(domain.domain)) {
+            //If domain is cover domain binary_sensor (check device_classes ("garage","shutter"))
+            return DEVICE_CLASSES[domain.domain].map((deviceClass) => {
+                const on = this._isOnCover(entitiesByDomain, domain.domain, deviceClass);
+                const off = this._isOffCover(entitiesByDomain, domain.domain, deviceClass);
+                if (on) {
+                    return this._renderDomainBadgeCard(domain.domain, translateEngine(this._hass, 'device.' + deviceClass), DOMAIN_STATE_ICONS[domain.domain][deviceClass], on, deviceClass);
+                }
+                if (off) {
+                    return this._renderDomainBadgeCard(domain.domain, translateEngine(this._hass, 'device.' + deviceClass), DOMAIN_STATE_ICONS[domain.domain][deviceClass], off, deviceClass);
+                }
+            });
+        } else if (CLIMATE_DOMAINS.includes(domain.domain)) {
+            //Its climate domain
+            const on = this._isOnClimate(entitiesByDomain, domain.domain);
+            if (on) {
+                return this._renderDomainBadgeCard(domain.domain, translateEngine(this._hass, 'device.' + domain.domain), DOMAIN_STATE_ICONS[domain.domain][on ? "on" : "off"], on, '');
+            }
+        } else if (OTHER_DOMAINS.includes(domain.domain)) {
+            //Its other domain
+            const on = this._isOn(entitiesByDomain, domain);
+            if (on) {
+                return this._renderDomainBadgeCard(domain.domain, translateEngine(this._hass, 'device.' + domain.domain), DOMAIN_STATE_ICONS[domain.domain][on ? "on" : "off"], on, '');
+            }
+        }
+    }
+    _renderDomainBadgeCard(domain, name, icon, count, deviceClass) {
+        let translatedStatus;
+        if ((deviceClass == 'window' || deviceClass == 'door' || domain == 'cover' || domain == 'lock') && !this.configuration['homepage_header']['invert_cover']) {
+            translatedStatus = translateEngine(this._hass, 'device.open')
+        } else if (this.configuration['homepage_header']['invert_cover'] && domain == 'cover') {
+            translatedStatus = translateEngine(this._hass, 'device.closed')
+        } else {
+            translatedStatus = translateEngine(this._hass, 'device.on')
+
+        }
+        return html`
+      <div class="dd-header-tab">
+        <div class="text-center cursor-pointer domain-badge-card" .domain=${domain} .deviceClass=${deviceClass} @click=${this._handleMoreInfo}>
+          <div class="rounded-full flex items-center justify-center m-auto round-badge" style="width: 50px; height: 50px;">
+            <div class="">
+              <ha-icon
+                class="w-8 h-8 badge-icon"
+                .icon=${this.configuration['devices'][domain] && this.configuration['devices'][domain]['icon'] ? this.configuration['devices'][domain]['icon'] : icon}
+              ></ha-icon>
+            </div>
+          </div>
+          <h3 class="capitalize">${name}</h3>
+          <span class="text-gray-500">
+          ${count} ${translatedStatus}
+          </span>
+        </div>
+      </div>
+      `;
+    }
+
+    _renderPersonCard(entity_id) {
+        const stateObj = this._hass.states[entity_id];
+        if (stateObj && stateObj.attributes) {
+            let imageUrl =
+                stateObj.attributes.entity_picture_local ||
+                stateObj.attributes.entity_picture;
+            if (imageUrl && this._hass) {
+                imageUrl = this._hass.hassUrl(imageUrl);
+            }
+            const name = this._entityDisplayName(entity_id);
+            return html`
+                <div class="dd-header-tab">
+                <div class="text-center cursor-pointer" .entity=${entity_id} @click=${this._handleMoreInfo}>
+                    ${imageUrl ? html`
+                    <img src="${imageUrl}" width="50" class="rounded-full m-auto ${stateObj.state}">
+                    ` : html`
+                    <div class="rounded-full flex items-center justify-center m-auto round-badge" style="width: 50px; height: 50px; margin-bottom: 6px;">
+                    <div class="">
+                        <ha-icon
+                        class="w-8 h-8 badge-icon"
+                        .icon=${"mdi:account"}
+                        ></ha-icon>
+                    </div>
+                    </div>
+                    `}
+                    <h3 class="capitalize">${name.split(' ')[0]}</h3>
+                    <span class="text-gray-500">
+                    ${myComputeStateDisplay(
+                        this._hass.localize,
+                        stateObj,
+                        this._hass.locale
+                    )}
+                    </span>
+                </div>
+                </div>`;
+        }
+    }
+
+    render() {
+        if (!this._hass) {
+            return html``;
+        }
+        if (this.domains == null || Object.keys(this.domains).length === 0) {
+            return html``;
+        } else {
+            return html`
+                <ha-card>
+                <div class="dd-header-tabs">
+                    ${this.persons.map((entity) => this._renderPersonCard(entity))}
+                    ${Object.values(this.domains).map((domain) => this._renderDomain(domain))}
+                </div>
+                </ha-card>
+            `;
+        }
+    }
+}
+
+defineDwainsElement("dwains-house-information-card", DwainsHouseInformationCard);

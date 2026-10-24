@@ -1,0 +1,11 @@
+# Home Assistant - Git Ignore File
+*.db
+*.db-*
+*.db-journal
+*.sqlite*
+*.log
+.storage/
+.cloud/
+__pycache__/
+.vscode/
+.git_credential_helper*.sh
